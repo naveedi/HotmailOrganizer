@@ -219,7 +219,7 @@ def store_access_in_db():
 
 # ---- Step 4: Fetch Latest Email ----
 def fetch_latest_email(access_token):
-    """Retrieves the most recent email from Hotmail/Outlook inbox."""
+    """Retrieves the most recent email from Hotmail/Outlook inbox and logs first 100 characters of the body."""
     headers = {"Authorization": f"Bearer {access_token}"}
     response = requests.get(GRAPH_API_URL, headers=headers)
 
@@ -233,11 +233,17 @@ def fetch_latest_email(access_token):
         return
 
     latest_email = emails[0]  # Most recent email
+    email_body = latest_email["body"]["content"] if "body" in latest_email and "content" in latest_email["body"] else ""
+
+    # Trim to first 100 characters, stripping unnecessary whitespace
+    email_preview = email_body.strip()[:100]  
+
     logging.info(f"Latest Email:\n"
                  f"Datetime: {latest_email['receivedDateTime']}\n"
                  f"Subject: {latest_email['subject']}\n"
                  f"Sender: {latest_email['from']['emailAddress']['address']}\n"
-                 f"Body:\n{latest_email['body']['content']}")
+                 f"Body (first 100 chars): {email_preview}")
+
 
 # ---- Step 5: Verify Access ----
 def verify_access_db():
