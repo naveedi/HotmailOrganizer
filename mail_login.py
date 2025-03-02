@@ -3,7 +3,9 @@ import requests
 import sqlite3
 import logging
 import time
-from datetime import datetime
+import re
+import jwt
+from datetime import datetime, timezone
 
 # Configuration
 DATABASE_FILE = "mail_login.db"
@@ -48,18 +50,90 @@ def log_to_database(name, value):
         conn.commit()
     logging.info(f"Logged to database: {name} = {value}")
 
+_token_cache = {}  # In-memory cache for tokens
+
 def get_value_from_db(name):
-    """Retrieves a value from the meta table."""
+    """Retrieves a value from the meta table, using a cache to minimize database queries."""
+    if name in _token_cache:
+        return _token_cache[name]  # Return cached value
+
     with sqlite3.connect(DATABASE_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM meta WHERE name = ?", (name,))
         result = cursor.fetchone()
-        return result[0] if result else None
+        value = result[0] if result else None
+
+    if value:
+        _token_cache[name] = value  # Cache it
+    return value
+
+
+def refresh_access_token():
+    """Refreshes the access token using the stored refresh token."""
+    refresh_token = get_value_from_db("refresh_token")
+
+    if not refresh_token:
+        logging.error("No refresh token found in database. Please reauthenticate.")
+        exit(1)
+
+    data = {
+        "client_id": CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token
+    }
+
+    response = requests.post(TOKEN_URL, data=data)
+    tokens = response.json()
+
+    if "access_token" in tokens and "refresh_token" in tokens:
+        logging.info("✅ Access token refreshed successfully!")
+
+        # Update access token and refresh token in the database
+        log_to_database("access_token", tokens["access_token"])
+        log_to_database("refresh_token", tokens["refresh_token"])
+
+        return tokens["access_token"]
+    else:
+        logging.error(f"❌ Error refreshing token: {tokens}")
+        exit(1)
+
+
+def get_access_token():
+    """Retrieves access token from the database and auto-refreshes if expired."""
+    access_token = get_value_from_db("access_token")
+    
+    if not access_token:
+        logging.error("No access token found in the database.")
+        exit(1)
+
+    # Validate JWT format (should contain at least 2 dots)
+    if not re.match(r"^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$", access_token):
+        logging.error("Stored access token is invalid or corrupt. Please reauthenticate.")
+        exit(1)
+
+    # Decode token to check expiration
+    try:
+        decoded_token = jwt.decode(access_token, options={"verify_signature": False})
+        exp_time = decoded_token["exp"]
+        current_time = int(time.time())
+
+        # If token is expired, refresh it
+        if current_time >= exp_time:
+            logging.info("Access token expired. Refreshing...")
+            return refresh_access_token()
+
+    except Exception as e:
+        logging.error(f"Failed to decode token: {e}")
+        exit(1)
+
+    return access_token
+
+
 
 # ---- Step 1: Registration ----
 def register_device():
-    """Requests a device code from Microsoft for authentication."""
-    log_to_database("mail_login start", datetime.utcnow().isoformat())
+    """Requests a device code from Microsoft for authentication and stores it in the database."""
+    log_to_database("mail_login start", datetime.now(timezone.utc).isoformat())
 
     data = {"client_id": CLIENT_ID, "scope": SCOPES}
     response = requests.post(DEVICE_CODE_URL, data=data)
@@ -70,24 +144,27 @@ def register_device():
         return
 
     # Log Registration Request
-    log_to_database("Registration Request", datetime.utcnow().isoformat())
+    log_to_database("Registration Request", datetime.now(timezone.utc).isoformat())
+    log_to_database("device_code", device_code_data["device_code"])
 
     # Display user instructions
     logging.info("Device Registration Successful!")
     logging.info(f"Go to {device_code_data['verification_uri']} and enter the code: {device_code_data['user_code']}")
 
-    # Save the device code for polling later
+    # Save the device code in a file as a backup
     with open("device_code.txt", "w") as file:
         file.write(device_code_data["device_code"])
 
+
+
 # ---- Step 2: Poll for Verification ----
 def poll_verification():
-    """Polls Microsoft for an access token using the device code."""
-    try:
-        with open("device_code.txt", "r") as file:
-            device_code = file.read().strip()
-    except FileNotFoundError:
-        logging.error("Device code not found. Run 'registration' first.")
+    """Polls Microsoft for an access token using the stored device code from the database. If expired, auto-restarts registration."""
+    device_code = get_value_from_db("device_code")
+
+    if not device_code:
+        logging.info("No device code found. Requesting a new one...")
+        register_device()
         return
 
     data = {
@@ -102,25 +179,30 @@ def poll_verification():
         response = requests.post(TOKEN_URL, data=data)
         tokens = response.json()
 
-        if "access_token" in tokens:
+        if "access_token" in tokens and "refresh_token" in tokens:
             logging.info("✅ Authentication successful!")
-            access_token = tokens["access_token"]
 
-            # Store access token in file and database
-            with open("access_token.txt", "w") as file:
-                file.write(access_token)
-            
-            log_to_database("Verification Response", datetime.utcnow().isoformat())
-            log_to_database("access_token", access_token)
+            # Store access and refresh tokens
+            log_to_database("Verification Response", datetime.now(timezone.utc).isoformat())
+            log_to_database("access_token", tokens["access_token"])
+            log_to_database("refresh_token", tokens["refresh_token"])
 
-            logging.info("Access token saved successfully.")
+            logging.info("Access token and refresh token saved successfully.")
             break
         elif tokens.get("error") == "authorization_pending":
             logging.info("Waiting for user to authenticate... Retrying in 5 seconds...")
             time.sleep(5)
+        elif tokens.get("error") == "expired_token":
+            logging.warning("⏳ Device code expired. Re-registering...")
+            log_to_database("device_code", "")  # Clear expired device code
+            register_device()  # Automatically restart registration
+            break
         else:
             logging.error(f"❌ Error: {tokens}")
             break
+
+
+
 
 # ---- Step 3: Storing Access Token ----
 def store_access_in_db():
@@ -159,8 +241,11 @@ def fetch_latest_email(access_token):
 
 # ---- Step 5: Verify Access ----
 def verify_access_db():
-    """Verifies access using the token stored in the database."""
-    access_token = get_value_from_db("access_token")
+    """
+    Verifies access using the stored access token in the database.
+    Automatically refreshes the token if expired.
+    """
+    access_token = get_access_token()
     if not access_token:
         logging.error("No access token found in database.")
         return
