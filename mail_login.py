@@ -18,6 +18,8 @@ DEVICE_CODE_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/de
 GRAPH_API_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
 SCOPES = "Mail.ReadWrite offline_access"
 
+BATCH_SIZE = 100  # Commit every 100 emails
+
 # Set up logging
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -39,16 +41,20 @@ def initialize_database():
         conn.commit()
 
 def log_to_database(name, value):
-    """Logs a timestamped entry into the meta table."""
-    with sqlite3.connect(DATABASE_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO meta (name, value, last_modified)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(name) DO UPDATE SET value = excluded.value, last_modified = excluded.last_modified
-        """, (name, value))
-        conn.commit()
-    logging.info(f"Logged to database: {name} = {value}")
+    """Logs a timestamped entry into the meta table while handling database errors."""
+    try:
+        with sqlite3.connect(DATABASE_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO meta (name, value, last_modified)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(name) DO UPDATE SET value = excluded.value, last_modified = excluded.last_modified
+            """, (name, value))
+            conn.commit()
+        logging.info(f"Logged to database: {name} = {value[:10] + '...'}")  # Mask long values for security
+    except sqlite3.DatabaseError as e:
+        logging.error(f"Database error: {e}")
+
 
 _token_cache = {}  # In-memory cache for tokens
 
@@ -64,8 +70,9 @@ def get_value_from_db(name):
         value = result[0] if result else None
 
     if value:
-        _token_cache[name] = value  # Cache it
+        _token_cache[name] = value  # Cache it for reuse
     return value
+
 
 
 def refresh_access_token():
@@ -101,32 +108,31 @@ def refresh_access_token():
 def get_access_token():
     """Retrieves access token from the database and auto-refreshes if expired."""
     access_token = get_value_from_db("access_token")
-    
+
     if not access_token:
         logging.error("No access token found in the database.")
         exit(1)
 
-    # Validate JWT format (should contain at least 2 dots)
     if not re.match(r"^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$", access_token):
         logging.error("Stored access token is invalid or corrupt. Please reauthenticate.")
         exit(1)
 
-    # Decode token to check expiration
     try:
         decoded_token = jwt.decode(access_token, options={"verify_signature": False})
         exp_time = decoded_token["exp"]
         current_time = int(time.time())
 
-        # If token is expired, refresh it
         if current_time >= exp_time:
             logging.info("Access token expired. Refreshing...")
             return refresh_access_token()
 
-    except Exception as e:
-        logging.error(f"Failed to decode token: {e}")
+    except jwt.DecodeError:
+        logging.error("Failed to decode JWT token. Possible corruption.")
         exit(1)
 
+    logging.info(f"Using cached access token: {access_token[:10]}... (masked for security)")
     return access_token
+
 
 
 
@@ -286,12 +292,162 @@ def verify_access():
 
     fetch_latest_email(access_token)
 
+
+
+# ---- Collect Senders ----
+def collect_senders():
+    """Collects all senders' email addresses and counts them, storing them in a new timestamped table."""
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    table_name = f"collection_senders_{timestamp}"
+    
+    initialize_database()
+    log_to_database("collection-senders-current-table", table_name)
+
+    with sqlite3.connect(DATABASE_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                email_address TEXT PRIMARY KEY,
+                friendly_name TEXT,
+                total_count INTEGER DEFAULT 1
+            )
+        """)
+        conn.commit()
+
+    log_to_database(f"collection-senders-{timestamp}-complete", "false")
+    process_senders(table_name, timestamp)
+
+def collect_senders_continue():
+    """Resumes collecting senders from where it last left off using delta queries."""
+    table_name = get_value_from_db("collection-senders-current-table")
+
+    if not table_name:
+        logging.error("No previous collection session found. Run 'collect-senders' first.")
+        return
+
+    # Check if collection is already complete
+    complete = get_value_from_db(f"collection-senders-{table_name.split('_')[-1]}-complete")
+    if complete == "true":
+        logging.info("Collection is already complete. No action needed.")
+        return
+
+    # Check for stored delta link
+    delta_link = get_value_from_db(f"collection-senders-{table_name.split('_')[-1]}-deltalink")
+    if not delta_link:
+        logging.warning("No delta link found. Restarting from full sync.")
+        collect_senders()  # Restart from scratch if no delta link is available
+        return
+
+    logging.info(f"Resuming collection using delta link: {delta_link[:50]}... (masked)")
+
+    # Resume processing using stored delta link
+    process_senders(table_name, table_name.split("_")[-1])
+
+
+def update_senders_table(sender_counts, table_name):
+    """
+    Updates sender counts in the SQLite database using bulk insert.
+    
+    If the email already exists, it increments its total count.
+    Otherwise, it inserts a new entry.
+    """
+    if not sender_counts:
+        return  # No updates needed
+
+    try:
+        with sqlite3.connect(DATABASE_FILE) as conn:
+            cursor = conn.cursor()
+            data = [(email, data["friendly_name"], data["total_count"]) for email, data in sender_counts.items()]
+            cursor.executemany(f"""
+                INSERT INTO {table_name} (email_address, friendly_name, total_count)
+                VALUES (?, ?, ?)
+                ON CONFLICT(email_address) DO UPDATE 
+                SET total_count = total_count + excluded.total_count
+            """, data)
+            conn.commit()
+        logging.info(f"Updated {len(sender_counts)} senders in {table_name}")
+    except sqlite3.DatabaseError as e:
+        logging.error(f"Database error while updating senders: {e}")
+
+
+
+def process_senders(table_name, timestamp):
+    """Fetches emails using delta queries for efficient incremental updates."""
+    access_token = get_access_token()
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    # Check if there is a previous delta link to continue from
+    delta_link = get_value_from_db(f"collection-senders-{timestamp}-deltalink")
+    if delta_link:
+        url = delta_link  # Continue from last stored delta query
+    else:
+        url = f"{GRAPH_API_URL}/delta?$top=50"  # Start a new delta query
+
+    sender_counts = {}
+    total_processed = 0
+    last_processed_time = None
+    last_processed_id = None
+
+    while True:
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            logging.error(f"Failed to retrieve emails: {response.json()}")
+            break
+
+        data = response.json()
+        emails = data.get("value", [])
+        if not emails:
+            logging.info("No more emails to process.")
+            break
+
+        for email in emails:
+            if email.get("@removed"):
+                # Email was deleted (delta query tracks deletions)
+                logging.info(f"Deleted email detected: ID={email['id']}")
+                continue  # Skip deleted emails
+
+            sender_email = email["from"]["emailAddress"]["address"]
+            sender_name = email["from"]["emailAddress"].get("name", "")
+
+            sender_counts[sender_email] = sender_counts.get(sender_email, {"friendly_name": sender_name, "total_count": 0})
+            sender_counts[sender_email]["total_count"] += 1
+
+            last_processed_time = email["receivedDateTime"]
+            last_processed_id = email["id"]
+            total_processed += 1
+
+            if total_processed % BATCH_SIZE == 0:
+                update_senders_table(sender_counts, table_name)  # Batch write
+                log_to_database(f"collection-senders-{timestamp}-last-time", last_processed_time)
+                log_to_database(f"collection-senders-{timestamp}-last-id", last_processed_id)
+                log_to_database(f"collection-senders-{timestamp}-count", str(total_processed))
+                sender_counts.clear()
+                logging.info(f"Processed {total_processed} emails. Last email: {last_processed_time} (ID: {last_processed_id})")
+
+        # Store new delta link for future incremental updates
+        delta_link = data.get("@odata.deltaLink")
+        if delta_link:
+            log_to_database(f"collection-senders-{timestamp}-deltalink", delta_link)
+
+    if sender_counts:
+        update_senders_table(sender_counts, table_name)  # Final batch write
+
+    if last_processed_time and last_processed_id:
+        log_to_database(f"collection-senders-{timestamp}-last-time", last_processed_time)
+        log_to_database(f"collection-senders-{timestamp}-last-id", last_processed_id)
+
+    log_to_database(f"collection-senders-{timestamp}-complete", "true")
+    logging.info(f"Collection completed. Total emails processed: {total_processed}")
+
+
+
+
 # ---- Main Execution ----
 def main():
     """Handles command-line arguments and executes the appropriate function."""
     parser = argparse.ArgumentParser(description="Hotmail Organizer - Authentication Manager")
     parser.add_argument("action", choices=["registration", "poll-verification", "store-access-in-db",
-                                           "verify-access-db", "verify-access-file", "verify-access"],
+                                           "verify-access", "collect-senders", "collect-senders-continue"],
                         help="Select the authentication step")
     
     args = parser.parse_args()
@@ -301,9 +457,9 @@ def main():
         "registration": register_device,
         "poll-verification": poll_verification,
         "store-access-in-db": store_access_in_db,
-        "verify-access-db": verify_access_db,
-        "verify-access-file": verify_access_file,
-        "verify-access": verify_access
+        "verify-access": verify_access,
+        "collect-senders": collect_senders,
+        "collect-senders-continue": collect_senders_continue
     }
 
     actions[args.action]()
