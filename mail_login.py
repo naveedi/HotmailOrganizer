@@ -107,6 +107,13 @@ def refresh_access_token():
         logging.error(f"❌ Error refreshing token: {tokens}")
         exit(1)
 
+def refresh_token_command():
+    """Explicitly refreshes the access token and logs the result."""
+    logging.info("🔄 Forcing an access token refresh...")
+    new_token = refresh_access_token()
+    logging.info("✅ Access token refreshed successfully and stored in the database.")
+
+
 def string_compare(str1, str2, max_diffs=5):
     """Compares two strings index by index and outputs differences up to max_diffs."""
     
@@ -356,7 +363,8 @@ def collect_emails():
         conn.commit()
 
     log_to_database(f"collection-emails-{timestamp}-complete", "false")
-    process_emails(table_name, timestamp)
+    #process_emails(table_name, timestamp)
+    process_emails_simplified(table_name, timestamp)
 
 
 
@@ -399,58 +407,118 @@ def fetch_emails_with_delta(url, headers):
 
     return all_emails, delta_link
 
-def process_emails(table_name, timestamp):
-    """Fetches emails using Microsoft Graph's delta queries in 100-email chunks, starting from the NEWEST emails."""
+
+def process_emails_simplified(table_name, timestamp):
+    """Fetches emails in order, writes them to the database, and logs progress every 100 emails."""
     access_token = get_access_token()
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    # Get last saved deltaLink if available
-    delta_link = get_value_from_db(f"collection-emails-{timestamp}-deltalink")
+    # Start fresh: Fetch newest emails first
+    url = f"{GRAPH_API_URL}?$orderby=receivedDateTime desc&$top=100"
 
-    if delta_link:
-        logging.info(f"🟢 Resuming email collection using delta link.")
-        url = delta_link  # Resume from last session
-    else:
-        logging.info(f"🟢 Starting new email collection (from newest messages).")
-        url = f"{GRAPH_API_URL}/delta?$top=100&$orderby=receivedDateTime desc"  # ✅ Now using 'desc'
-
-    total_processed = 0  # Track number of emails processed
+    total_processed = 0
+    email_data = []  # Store data in memory before batch insert
 
     while url:
         response = requests.get(url, headers=headers)
-        
+
         if response.status_code != 200:
             logging.error(f"❌ Failed to retrieve emails: {response.json()}")
             break
 
         response_json = response.json()
         emails = response_json.get("value", [])
-        next_link = response_json.get("@odata.nextLink")  # For pagination
-        delta_link = response_json.get("@odata.deltaLink")  # For session resumption
+        url = response_json.get("@odata.nextLink")  # Get the next page of results
 
-        if emails:
-            # **Reverse order to process oldest first in memory**
-            emails.reverse()
-            total_processed = process_email_metadata_batch(emails, table_name, total_processed)
+        if not emails:
+            logging.info("✅ No more emails to process.")
+            break
 
-        # **If `nextLink` exists, continue paginating in this session**
-        if next_link:
-            logging.info(f"🔄 Fetching next batch of 100 emails...")
-            url = next_link  # **Next batch (increments window)**
-        elif delta_link:
-            logging.info(f"✅ Storing delta link for future runs.")
-            log_to_database(f"collection-emails-{timestamp}-deltalink", delta_link)  # **Save for next session**
-            url = None  # Stop fetching
+        # Process emails one by one
+        for email in emails:
+            try:
+                sender_email = email.get("from", {}).get("emailAddress", {}).get("address", "")
+                sender_name = email.get("from", {}).get("emailAddress", {}).get("name", "")
+                email_datetime = email.get("receivedDateTime", "")
+                subject = email.get("subject", "(No Subject)")
+
+                to_recipients = email.get("toRecipients", [])
+                to_email = to_recipients[0]["emailAddress"]["address"] if to_recipients else ""
+                to_name = to_recipients[0]["emailAddress"]["name"] if to_recipients else ""
+
+                from_email = email.get("from", {}).get("emailAddress", {}).get("address", "")
+                from_name = email.get("from", {}).get("emailAddress", {}).get("name", "")
+
+                # Log warnings for missing critical fields
+                if not sender_email:
+                    logging.warning(f"⚠️ Missing sender email in message {email.get('id', '(unknown ID)')}")
+                if not email_datetime:
+                    logging.warning(f"⚠️ Missing datetime in message {email.get('id', '(unknown ID)')}")
+
+                total_processed += 1
+
+                # Store email data for batch writing
+                email_data.append((sender_email, sender_name, email_datetime, to_email, to_name, from_email, from_name))
+
+                # Log progress every 100 emails
+                if total_processed % 100 == 0:
+                    logging.info(f"📨 {total_processed} processed | {email_datetime} | {subject}")
+
+            except Exception as e:
+                logging.error(f"❌ Error processing email: {e}")
+                continue  # Skip this email and move to the next
+
+        # Insert collected emails into the database in batches
+        if email_data:
+            update_email_table(email_data, table_name)
+            email_data.clear()  # Clear stored emails after writing
+
+    logging.info(f"🎉 Completed processing {total_processed} emails.")
+
+
+
+def process_emails(table_name, timestamp):
+    """Fetches emails using Microsoft Graph's delta queries and stores metadata into the database."""
+    access_token = get_access_token()
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    # Get last saved delta link if available (used only for resuming sessions)
+    delta_link = get_value_from_db(f"collection-emails-{timestamp}-deltalink")
+
+    if delta_link:
+        logging.info("📌 Resuming email collection using stored delta link.")
+        url = delta_link  # Use the saved delta query URL
+    else:
+        logging.info("🆕 Starting new email collection (fetching most recent first).")
+        url = f"{GRAPH_API_URL}/delta?$orderby=receivedDateTime desc&$top=100"  # ✅ Most recent first
+
+    total_processed = 0
+    last_processed_time = None  # Track latest timestamp
+
+    while url:
+        emails, next_delta_link = fetch_emails_with_delta(url, headers)
+        if not emails:
+            logging.info("✅ No more emails to process.")
+            break
+
+        # ✅ Correct tuple unpacking
+        total_processed, last_processed_time = process_email_metadata_batch(emails, table_name, total_processed)
+
+        # ✅ Store delta link for continuation
+        if next_delta_link:
+            log_to_database(f"collection-emails-{timestamp}-deltalink", next_delta_link)
+            url = next_delta_link  # Use delta link for next iteration
         else:
-            logging.info("🔴 No more data. Ending session.")
-            url = None  # No more emails
+            logging.info("🚀 No delta link found; reached the end of the traversal.")
+            url = None
 
+        # ✅ Store progress periodically in the database
         log_to_database(f"collection-emails-{timestamp}-count", str(total_processed))
-        logging.info(f"📨 Processed {total_processed} emails.")
+        logging.info(f"📨 Processed {total_processed} emails. Last email: {last_processed_time}")
 
+    # ✅ Mark collection as complete
     log_to_database(f"collection-emails-{timestamp}-complete", "true")
-    logging.info(f"✅ Email collection completed. Total emails processed: {total_processed}")
-
+    logging.info(f"🎉 Email collection completed. Total emails processed: {total_processed}")
 
 
 
@@ -610,7 +678,7 @@ def main():
     parser = argparse.ArgumentParser(description="Hotmail Organizer - Authentication Manager")
     parser.add_argument("action", choices=["registration", "poll-verification", "store-access-in-db",
                                            "verify-access", 
-                                           "collect-emails", "collect-emails-continue", "process-senders" ],
+                                           "collect-emails", "collect-emails-continue", "process-senders", "refresh-token" ],
                         help="Select the authentication step")
     
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -628,7 +696,8 @@ def main():
         "verify-access": verify_access,
         "collect-emails": collect_emails,
         "collect-emails-continue": collect_emails_continue,
-        "process-senders": process_senders
+        "process-senders": process_senders,
+        "refresh-token": refresh_token_command,  
     }
 
     actions[args.action]()
