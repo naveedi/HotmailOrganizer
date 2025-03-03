@@ -5,6 +5,7 @@ import logging
 import time
 import re
 import jwt
+import hashlib
 from datetime import datetime, timezone
 
 # Configuration
@@ -34,7 +35,7 @@ def initialize_database():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS meta (
                 name TEXT PRIMARY KEY,
-                value TEXT,
+                value TEXT NOT NULL,
                 last_modified DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -43,6 +44,7 @@ def initialize_database():
 def log_to_database(name, value):
     """Logs a timestamped entry into the meta table while handling database errors."""
     try:
+        value = value.strip()  # Ensure no trailing spaces or newlines
         with sqlite3.connect(DATABASE_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -51,9 +53,9 @@ def log_to_database(name, value):
                 ON CONFLICT(name) DO UPDATE SET value = excluded.value, last_modified = excluded.last_modified
             """, (name, value))
             conn.commit()
-        logging.info(f"Logged to database: {name} = {value[:10] + '...'}")  # Mask long values for security
+        logging.info(f"✅ DB Updated: {name} = {value[:20]}... (masked)")  # Mask for security
     except sqlite3.DatabaseError as e:
-        logging.error(f"Database error: {e}")
+        logging.error(f"❌ Database error: {e}")
 
 
 _token_cache = {}  # In-memory cache for tokens
@@ -104,36 +106,71 @@ def refresh_access_token():
         logging.error(f"❌ Error refreshing token: {tokens}")
         exit(1)
 
+def string_compare(str1, str2, max_diffs=5):
+    """Compares two strings index by index and outputs differences up to max_diffs."""
+    
+    # Generate header with first 20 characters and lengths
+    header = f"compare str1:20({str1[:50]}) to str2:20({str2[:50]}) | lengths: {len(str1)} vs {len(str2)}"
+    print(header)
+    
+    min_length = min(len(str1), len(str2))
+    differences = []
+    
+    # Compare characters index by index
+    for i in range(min_length):
+        if str1[i] != str2[i]:
+            differences.append(f"diff({i:03}) '{str1[i]}' != '{str2[i]}'")
+            if len(differences) >= max_diffs:
+                break
 
-def get_access_token():
-    """Retrieves access token from the database and auto-refreshes if expired."""
+    # Handle cases where one string is longer
+    if len(differences) < max_diffs:
+        if len(str1) > len(str2):
+            for i in range(min_length, len(str1)):
+                differences.append(f"diff({i:03}) '{str1[i]}' != ''")
+                if len(differences) >= max_diffs:
+                    break
+        elif len(str2) > len(str1):
+            for i in range(min_length, len(str2)):
+                differences.append(f"diff({i:03}) '' != '{str2[i]}'")
+                if len(differences) >= max_diffs:
+                    break
+
+    # Print results
+    if differences:
+        for diff in differences:
+            print(diff)
+    else:
+        print("Strings are identical")
+
+def get_access_token(caller="unknown"):
+    """Retrieves access token from the database and logs debug info."""
     access_token = get_value_from_db("access_token")
 
     if not access_token:
-        logging.error("No access token found in the database.")
+        logging.error(f"[{caller}] No access token found in the database.")
         exit(1)
 
-    if not re.match(r"^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$", access_token):
-        logging.error("Stored access token is invalid or corrupt. Please reauthenticate.")
-        exit(1)
+    logging.info(f"[{caller}] Using access token: {access_token[:20]}... (masked)")
 
-    try:
-        decoded_token = jwt.decode(access_token, options={"verify_signature": False})
-        exp_time = decoded_token["exp"]
-        current_time = int(time.time())
+    # Only attempt to decode if the token has 3 segments (JWT format)
+    if access_token.count('.') == 2:
+        try:
+            decoded_token = jwt.decode(access_token, options={"verify_signature": False})
+            exp_time = decoded_token["exp"]
+            current_time = int(time.time())
 
-        if current_time >= exp_time:
-            logging.info("Access token expired. Refreshing...")
-            return refresh_access_token()
+            if current_time >= exp_time:
+                logging.info(f"[{caller}] Access token expired. Refreshing...")
+                return refresh_access_token()
 
-    except jwt.DecodeError:
-        logging.error("Failed to decode JWT token. Possible corruption.")
-        exit(1)
+        except jwt.DecodeError:
+            logging.warning(f"[{caller}] Token is not a valid JWT, but it may still be a valid opaque token.")
 
-    logging.info(f"Using cached access token: {access_token[:10]}... (masked for security)")
+    else:
+        logging.info(f"[{caller}] Token is not a JWT (may be an opaque token). Skipping decode.")
+
     return access_token
-
-
 
 
 # ---- Step 1: Registration ----
@@ -252,52 +289,22 @@ def fetch_latest_email(access_token):
 
 
 # ---- Step 5: Verify Access ----
-def verify_access_db():
+def verify_access():
     """
     Verifies access using the stored access token in the database.
     Automatically refreshes the token if expired.
     """
-    access_token = get_access_token()
-    if not access_token:
-        logging.error("No access token found in database.")
-        return
 
+    logging.info("[verify-access] Calling get_access_token()...")
+    access_token = get_access_token(caller="verify-access")
+    logging.info("[verify-access] Retrieved access token successfully.")
     fetch_latest_email(access_token)
-
-def verify_access_file():
-    """Verifies access using the token stored in the file."""
-    try:
-        with open("access_token.txt", "r") as file:
-            access_token = file.read().strip()
-    except FileNotFoundError:
-        logging.error("Access token file not found.")
-        return
-
-    fetch_latest_email(access_token)
-
-def verify_access():
-    """Tries access token from database first, falls back to file, and stores it if necessary."""
-    access_token = get_value_from_db("access_token")
-
-    if not access_token:
-        logging.info("No access token in database. Checking file...")
-        try:
-            with open("access_token.txt", "r") as file:
-                access_token = file.read().strip()
-                log_to_database("access_token", access_token)  # Save to database
-                logging.info("Stored access token from file into database.")
-        except FileNotFoundError:
-            logging.error("No access token found in database or file.")
-            return
-
-    fetch_latest_email(access_token)
-
 
 
 # ---- Collect Senders ----
 def collect_senders():
     """Collects all senders' email addresses and counts them, storing them in a new timestamped table."""
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     table_name = f"collection_senders_{timestamp}"
     
     initialize_database()
@@ -368,8 +375,6 @@ def update_senders_table(sender_counts, table_name):
         logging.info(f"Updated {len(sender_counts)} senders in {table_name}")
     except sqlite3.DatabaseError as e:
         logging.error(f"Database error while updating senders: {e}")
-
-
 
 def process_senders(table_name, timestamp):
     """Fetches emails using delta queries for efficient incremental updates."""
