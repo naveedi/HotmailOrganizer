@@ -6,6 +6,7 @@ import time
 import re
 import jwt
 import hashlib
+import json
 from datetime import datetime, timezone
 
 # Configuration
@@ -245,8 +246,6 @@ def poll_verification():
             break
 
 
-
-
 # ---- Step 3: Storing Access Token ----
 def store_access_in_db():
     """Reads access token from file and stores it in the database."""
@@ -261,31 +260,62 @@ def store_access_in_db():
     logging.info("Stored access token in database.")
 
 # ---- Step 4: Fetch Latest Email ----
+
+import json
+
+def display_email_fields(email):
+    """Displays all fields of an email, pretty-printing JSON structures and truncating output at 1000 characters."""
+    logging.info("🔍 Displaying all available email fields:")
+
+    for key, value in email.items():
+        # Convert value into a readable string
+        if isinstance(value, dict) or isinstance(value, list):
+            value_str = json.dumps(value, indent=2)  # Pretty-print JSON structures
+        else:
+            value_str = str(value)  # Convert non-string values safely
+
+        # Truncate to 1000 characters
+        value_str = value_str[:100] + "..." if len(value_str) > 1000 else value_str
+
+        logging.info(f"{key}: {value_str}")
+
+
+
 def fetch_latest_email(access_token):
-    """Retrieves the most recent email from Hotmail/Outlook inbox and logs first 100 characters of the body."""
+    """Retrieves the most recent email and displays all its fields."""
     headers = {"Authorization": f"Bearer {access_token}"}
     response = requests.get(GRAPH_API_URL, headers=headers)
 
     if response.status_code != 200:
-        logging.error(f"Failed to retrieve emails: {response.json()}")
+        logging.error(f"❌ Failed to retrieve emails: {response.json()}")
         return
 
     emails = response.json().get("value", [])
     if not emails:
-        logging.info("No emails found.")
+        logging.info("📭 No emails found.")
         return
 
     latest_email = emails[0]  # Most recent email
+    logging.info(f"✅ Latest Email Retrieved (ID: {latest_email.get('id', 'Unknown')})")
+
+    # Call the new helper method to display all fields
+    # display_email_fields(latest_email)
+
     email_body = latest_email["body"]["content"] if "body" in latest_email and "content" in latest_email["body"] else ""
 
-    # Trim to first 100 characters, stripping unnecessary whitespace
-    email_preview = email_body.strip()[:100]  
+    sender_email = latest_email["from"]["emailAddress"]["address"]
+    sender_name = latest_email["from"]["emailAddress"].get("name", "")
 
-    logging.info(f"Latest Email:\n"
-                 f"Datetime: {latest_email['receivedDateTime']}\n"
-                 f"Subject: {latest_email['subject']}\n"
-                 f"Sender: {latest_email['from']['emailAddress']['address']}\n"
-                 f"Body (first 100 chars): {email_preview}")
+    from_email = latest_email.get("sender", {}).get("emailAddress", {}).get("address", "")
+    from_name = latest_email.get("sender", {}).get("emailAddress", {}).get("name", "")
+
+    logging.info(f"✅ Latest Email Retrieved (ID: {latest_email['id']})")
+    logging.info(f"Sender: {sender_name} <{sender_email}>")
+    logging.info(f"From: {from_name} <{from_email}>")
+    logging.info(f"Subject: {latest_email['subject']}")
+    logging.info(f"Received At: {latest_email['receivedDateTime']}")
+    logging.info(f"Body (first 100 chars): {email_body.strip()[:100]}")
+
 
 
 # ---- Step 5: Verify Access ----
@@ -301,150 +331,259 @@ def verify_access():
     fetch_latest_email(access_token)
 
 
-# ---- Collect Senders ----
-def collect_senders():
-    """Collects all senders' email addresses and counts them, storing them in a new timestamped table."""
+def collect_emails():
+    """Starts a new email collection process."""
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    table_name = f"collection_senders_{timestamp}"
-    
+    table_name = f"collection_emails_{timestamp}"
+
     initialize_database()
-    log_to_database("collection-senders-current-table", table_name)
+    log_to_database("collection-emails-current-table", table_name)
 
     with sqlite3.connect(DATABASE_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS {table_name} (
-                email_address TEXT PRIMARY KEY,
-                friendly_name TEXT,
-                total_count INTEGER DEFAULT 1
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_email TEXT,
+                sender_friendly_name TEXT,
+                email_datetime TEXT,
+                to_email TEXT,
+                to_friendly_name TEXT,
+                from_email TEXT,
+                from_friendly_name TEXT
             )
         """)
         conn.commit()
 
-    log_to_database(f"collection-senders-{timestamp}-complete", "false")
-    process_senders(table_name, timestamp)
+    log_to_database(f"collection-emails-{timestamp}-complete", "false")
+    process_emails(table_name, timestamp)
 
-def collect_senders_continue():
-    """Resumes collecting senders from where it last left off using delta queries."""
-    table_name = get_value_from_db("collection-senders-current-table")
+
+
+def collect_emails_continue():
+    """Resumes email collection using the last stored delta link."""
+    table_name = get_value_from_db("collection-emails-current-table")
 
     if not table_name:
-        logging.error("No previous collection session found. Run 'collect-senders' first.")
+        logging.error("No previous email collection session found. Run 'collect-emails' first.")
         return
 
-    # Check if collection is already complete
-    complete = get_value_from_db(f"collection-senders-{table_name.split('_')[-1]}-complete")
+    complete = get_value_from_db(f"{table_name}-complete")
     if complete == "true":
-        logging.info("Collection is already complete. No action needed.")
+        logging.info("Email collection is already complete. No action needed.")
         return
 
-    # Check for stored delta link
-    delta_link = get_value_from_db(f"collection-senders-{table_name.split('_')[-1]}-deltalink")
-    if not delta_link:
-        logging.warning("No delta link found. Restarting from full sync.")
-        collect_senders()  # Restart from scratch if no delta link is available
-        return
-
-    logging.info(f"Resuming collection using delta link: {delta_link[:50]}... (masked)")
-
-    # Resume processing using stored delta link
-    process_senders(table_name, table_name.split("_")[-1])
+    process_emails(table_name, table_name.split("_")[-1])
 
 
-def update_senders_table(sender_counts, table_name):
-    """
-    Updates sender counts in the SQLite database using bulk insert.
+def fetch_emails_with_delta(url, headers):
+    """Fetches emails using Microsoft Graph's delta query and returns emails + next delta link."""
+    response = requests.get(url, headers=headers)
     
-    If the email already exists, it increments its total count.
-    Otherwise, it inserts a new entry.
-    """
-    if not sender_counts:
-        return  # No updates needed
+    if response.status_code != 200:
+        logging.error(f"Failed to retrieve emails: {response.json()}")
+        return [], None
 
-    try:
-        with sqlite3.connect(DATABASE_FILE) as conn:
-            cursor = conn.cursor()
-            data = [(email, data["friendly_name"], data["total_count"]) for email, data in sender_counts.items()]
-            cursor.executemany(f"""
-                INSERT INTO {table_name} (email_address, friendly_name, total_count)
-                VALUES (?, ?, ?)
-                ON CONFLICT(email_address) DO UPDATE 
-                SET total_count = total_count + excluded.total_count
-            """, data)
-            conn.commit()
-        logging.info(f"Updated {len(sender_counts)} senders in {table_name}")
-    except sqlite3.DatabaseError as e:
-        logging.error(f"Database error while updating senders: {e}")
+    response_json = response.json()
+    emails = response_json.get("value", [])
+    
+    # Prefer `@odata.deltaLink` over `@odata.nextLink`
+    delta_link = response_json.get("@odata.deltaLink", response_json.get("@odata.nextLink"))
 
-def process_senders(table_name, timestamp):
-    """Fetches emails using delta queries for efficient incremental updates."""
+    return emails, delta_link
+
+
+def process_emails(table_name, timestamp):
+    """Fetches emails using Microsoft Graph's delta queries and stores metadata into the database."""
     access_token = get_access_token()
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    # Check if there is a previous delta link to continue from
-    delta_link = get_value_from_db(f"collection-senders-{timestamp}-deltalink")
+    # Get last saved deltaLink if available
+    delta_link = get_value_from_db(f"collection-emails-{timestamp}-deltalink")
+
     if delta_link:
-        url = delta_link  # Continue from last stored delta query
+        logging.info(f"Resuming email collection using stored delta link.")
+        url = delta_link  # Use saved delta query URL
     else:
-        url = f"{GRAPH_API_URL}/delta?$top=50"  # Start a new delta query
+        logging.info(f"Starting new email collection from scratch.")
+        url = f"{GRAPH_API_URL}/delta?$top=50"
 
-    sender_counts = {}
     total_processed = 0
-    last_processed_time = None
-    last_processed_id = None
+    last_processed_time = None  # Track last processed timestamp
 
-    while True:
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            logging.error(f"Failed to retrieve emails: {response.json()}")
-            break
-
-        data = response.json()
-        emails = data.get("value", [])
+    while url:
+        emails, next_delta_link = fetch_emails_with_delta(url, headers)
         if not emails:
             logging.info("No more emails to process.")
             break
 
-        for email in emails:
-            if email.get("@removed"):
-                # Email was deleted (delta query tracks deletions)
-                logging.info(f"Deleted email detected: ID={email['id']}")
-                continue  # Skip deleted emails
+        # ✅ FIX: Unpacking correctly to avoid tuple concatenation error
+        total_processed, last_processed_time = process_email_metadata_batch(emails, table_name, total_processed)
 
-            sender_email = email["from"]["emailAddress"]["address"]
-            sender_name = email["from"]["emailAddress"].get("name", "")
+        # Store deltaLink for continuation
+        if next_delta_link:
+            log_to_database(f"collection-emails-{timestamp}-deltalink", next_delta_link)
+            url = next_delta_link  # Use deltaLink for next iteration
+        else:
+            logging.info("No delta link found; reached end of traversal.")
+            url = None
 
-            sender_counts[sender_email] = sender_counts.get(sender_email, {"friendly_name": sender_name, "total_count": 0})
+        log_to_database(f"collection-emails-{timestamp}-count", str(total_processed))
+        logging.info(f"Processed ({total_processed}, '{last_processed_time}') emails.")
+
+    log_to_database(f"collection-emails-{timestamp}-complete", "true")
+    logging.info(f"Email collection completed. Total emails processed: {total_processed}")
+
+
+
+def process_email_metadata_batch(emails, table_name, total_processed):
+    """Processes a batch of emails, extracting full metadata and inserting into the database."""
+    email_data = []
+    last_processed_time = None  # Track last timestamp
+
+    for email in emails:
+        sender_email = email["from"]["emailAddress"]["address"]
+        sender_name = email["from"]["emailAddress"].get("name", "")
+        email_datetime = email["receivedDateTime"]  # Extract timestamp
+
+        to_email = email.get("toRecipients", [])
+        to_email = to_email[0]["emailAddress"]["address"] if to_email else ""
+
+        to_name = email.get("toRecipients", [])
+        to_name = to_name[0]["emailAddress"].get("name", "") if to_name else ""
+
+        from_email = email.get("sender", {}).get("emailAddress", {}).get("address", "")
+        from_name = email.get("sender", {}).get("emailAddress", {}).get("name", "")
+
+        total_processed += 1
+        last_processed_time = email_datetime  # Update latest timestamp
+
+        email_data.append((sender_email, sender_name, email_datetime, to_email, to_name, from_email, from_name))
+
+        # Debug log: Print each processed email
+        logging.debug(f"{total_processed:05}, {sender_email}, {sender_name}, {email_datetime}, {to_email}, {to_name}, {from_email}, {from_name}")
+
+    if email_data:
+        update_email_table(email_data, table_name)
+
+    return total_processed, last_processed_time  # Return updated last time
+
+
+def update_email_table(email_data, table_name):
+    """Inserts processed email metadata into the database."""
+    try:
+        with sqlite3.connect(DATABASE_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.executemany(f"""
+                INSERT INTO {table_name} (sender_email, sender_friendly_name, email_datetime, 
+                                          to_email, to_friendly_name, from_email, from_friendly_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, email_data)
+            conn.commit()
+        logging.info(f"Inserted {len(email_data)} emails into {table_name}")
+    except sqlite3.DatabaseError as e:
+        logging.error(f"Database error while inserting emails: {e}")
+
+
+
+def fetch_emails(headers, params):
+    """Fetches emails from Microsoft Graph API."""
+    response = requests.get(GRAPH_API_URL, headers=headers, params=params)
+    
+    if response.status_code != 200:
+        logging.error(f"Failed to retrieve emails: {response.json()}")
+        return []
+
+    return response.json().get("value", [])
+
+
+def process_email_batch(emails, sender_counts, total_processed):
+    """Processes a batch of emails, extracting sender info and updating counts."""
+    for email in emails:
+        sender_email = email["from"]["emailAddress"]["address"]
+        sender_name = email["from"]["emailAddress"].get("name", "")
+        email_datetime = email["receivedDateTime"]
+        email_subject = email["subject"]
+
+        # Update sender count
+        if sender_email in sender_counts:
             sender_counts[sender_email]["total_count"] += 1
+        else:
+            sender_counts[sender_email] = {"friendly_name": sender_name, "total_count": 1}
 
-            last_processed_time = email["receivedDateTime"]
-            last_processed_id = email["id"]
-            total_processed += 1
+        total_processed += 1
 
-            if total_processed % BATCH_SIZE == 0:
-                update_senders_table(sender_counts, table_name)  # Batch write
-                log_to_database(f"collection-senders-{timestamp}-last-time", last_processed_time)
-                log_to_database(f"collection-senders-{timestamp}-last-id", last_processed_id)
-                log_to_database(f"collection-senders-{timestamp}-count", str(total_processed))
-                sender_counts.clear()
-                logging.info(f"Processed {total_processed} emails. Last email: {last_processed_time} (ID: {last_processed_id})")
+        # Log each processed email
+        logging.debug(f"{total_processed:05}, {sender_email}, {email_subject}, {email_datetime}")
 
-        # Store new delta link for future incremental updates
-        delta_link = data.get("@odata.deltaLink")
-        if delta_link:
-            log_to_database(f"collection-senders-{timestamp}-deltalink", delta_link)
-
-    if sender_counts:
-        update_senders_table(sender_counts, table_name)  # Final batch write
-
-    if last_processed_time and last_processed_id:
-        log_to_database(f"collection-senders-{timestamp}-last-time", last_processed_time)
-        log_to_database(f"collection-senders-{timestamp}-last-id", last_processed_id)
-
-    log_to_database(f"collection-senders-{timestamp}-complete", "true")
-    logging.info(f"Collection completed. Total emails processed: {total_processed}")
+    return total_processed, email_datetime  # Return new count and last email timestamp
 
 
+def process_senders():
+    """Processes collected emails to generate sender statistics: first email, last email, and count."""
+    table_name = get_value_from_db("collection-emails-current-table")
+
+    if not table_name:
+        logging.error("No collected emails found. Run 'collect-emails' first.")
+        return
+
+    # Create the sender summary table name based on the email collection table
+    timestamp = table_name.split("_")[-1]  # Extract datetime from table name
+    senders_table = f"collection_senders_{timestamp}"
+
+    # Initialize database and connection
+    initialize_database()
+
+    with sqlite3.connect(DATABASE_FILE) as conn:
+        cursor = conn.cursor()
+
+        # Ensure the new senders table exists
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {senders_table} (
+                sender_email TEXT PRIMARY KEY,
+                first_email TEXT,
+                last_email TEXT,
+                count INTEGER
+            )
+        """)
+        conn.commit()
+
+        # Fetch all sender email and timestamps from the collected emails
+        cursor.execute(f"SELECT sender_email, email_datetime FROM {table_name}")
+        rows = cursor.fetchall()
+
+    if not rows:
+        logging.warning(f"No emails found in {table_name}. Nothing to process.")
+        return
+
+    # Process sender statistics in-memory
+    sender_stats = {}
+
+    for sender_email, email_datetime in rows:
+        if sender_email not in sender_stats:
+            sender_stats[sender_email] = {
+                "first_email": email_datetime,
+                "last_email": email_datetime,
+                "count": 1
+            }
+        else:
+            sender_stats[sender_email]["first_email"] = min(sender_stats[sender_email]["first_email"], email_datetime)
+            sender_stats[sender_email]["last_email"] = max(sender_stats[sender_email]["last_email"], email_datetime)
+            sender_stats[sender_email]["count"] += 1
+
+    # Insert processed sender data back into the database
+    with sqlite3.connect(DATABASE_FILE) as conn:
+        cursor = conn.cursor()
+        sender_data = [(email, data["first_email"], data["last_email"], data["count"]) for email, data in sender_stats.items()]
+
+        cursor.executemany(f"""
+            INSERT INTO {senders_table} (sender_email, first_email, last_email, count)
+            VALUES (?, ?, ?, ?)
+        """, sender_data)
+        conn.commit()
+
+    logging.info(f"✅ Processed {len(sender_stats)} senders and stored them in {senders_table}")
+    log_to_database("collection-senders-current-table", senders_table)
 
 
 # ---- Main Execution ----
@@ -452,19 +591,26 @@ def main():
     """Handles command-line arguments and executes the appropriate function."""
     parser = argparse.ArgumentParser(description="Hotmail Organizer - Authentication Manager")
     parser.add_argument("action", choices=["registration", "poll-verification", "store-access-in-db",
-                                           "verify-access", "collect-senders", "collect-senders-continue"],
+                                           "verify-access", 
+                                           "collect-emails", "collect-emails-continue", "process-senders" ],
                         help="Select the authentication step")
     
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+
     args = parser.parse_args()
     initialize_database()  # Ensure the database is set up
+
+    if args.debug:
+            logging.getLogger().setLevel(logging.DEBUG)
 
     actions = {
         "registration": register_device,
         "poll-verification": poll_verification,
         "store-access-in-db": store_access_in_db,
         "verify-access": verify_access,
-        "collect-senders": collect_senders,
-        "collect-senders-continue": collect_senders_continue
+        "collect-emails": collect_emails,
+        "collect-emails-continue": collect_emails_continue,
+        "process-senders": process_senders
     }
 
     actions[args.action]()
