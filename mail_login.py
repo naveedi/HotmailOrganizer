@@ -400,20 +400,19 @@ def fetch_emails_with_delta(url, headers):
     return all_emails, delta_link
 
 def process_emails(table_name, timestamp):
-    """Fetch emails using Microsoft Graph's delta queries in 100-email chunks, starting from the OLDEST."""
+    """Fetches emails using Microsoft Graph's delta queries in 100-email chunks, starting from the NEWEST emails."""
     access_token = get_access_token()
     headers = {"Authorization": f"Bearer {access_token}"}
-    
-    # Retrieve last stored deltaLink for continuing a previous session
+
+    # Get last saved deltaLink if available
     delta_link = get_value_from_db(f"collection-emails-{timestamp}-deltalink")
-    
-    # If resuming, use deltaLink. Otherwise, start from the oldest emails with a delta query
+
     if delta_link:
         logging.info(f"🟢 Resuming email collection using delta link.")
         url = delta_link  # Resume from last session
     else:
-        logging.info(f"🟢 Starting new email collection from oldest messages.")
-        url = f"{GRAPH_API_URL}/delta?$top=100&$orderby=receivedDateTime asc"
+        logging.info(f"🟢 Starting new email collection (from newest messages).")
+        url = f"{GRAPH_API_URL}/delta?$top=100&$orderby=receivedDateTime desc"  # ✅ Now using 'desc'
 
     total_processed = 0  # Track number of emails processed
 
@@ -430,6 +429,8 @@ def process_emails(table_name, timestamp):
         delta_link = response_json.get("@odata.deltaLink")  # For session resumption
 
         if emails:
+            # **Reverse order to process oldest first in memory**
+            emails.reverse()
             total_processed = process_email_metadata_batch(emails, table_name, total_processed)
 
         # **If `nextLink` exists, continue paginating in this session**
@@ -449,6 +450,7 @@ def process_emails(table_name, timestamp):
 
     log_to_database(f"collection-emails-{timestamp}-complete", "true")
     logging.info(f"✅ Email collection completed. Total emails processed: {total_processed}")
+
 
 
 
