@@ -377,62 +377,78 @@ def collect_emails_continue():
 
 
 def fetch_emails_with_delta(url, headers):
-    """Fetches emails using Microsoft Graph's delta query and returns emails + next delta link."""
-    response = requests.get(url, headers=headers)
-    
-    if response.status_code != 200:
-        logging.error(f"Failed to retrieve emails: {response.json()}")
-        return [], None
-
-    response_json = response.json()
-    emails = response_json.get("value", [])
-    
-    # Prefer `@odata.deltaLink` over `@odata.nextLink`
-    delta_link = response_json.get("@odata.deltaLink", response_json.get("@odata.nextLink"))
-
-    return emails, delta_link
-
-
-def process_emails(table_name, timestamp):
-    """Fetches emails using Microsoft Graph's delta queries and stores metadata into the database."""
-    access_token = get_access_token()
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    # Get last saved deltaLink if available
-    delta_link = get_value_from_db(f"collection-emails-{timestamp}-deltalink")
-
-    if delta_link:
-        logging.info(f"Resuming email collection using stored delta link.")
-        url = delta_link  # Use saved delta query URL
-    else:
-        logging.info(f"Starting new email collection from scratch.")
-        url = f"{GRAPH_API_URL}/delta?$top=50"
-
-    total_processed = 0
-    last_processed_time = None  # Track last processed timestamp
+    """Fetches emails using Microsoft Graph's delta query and handles pagination."""
+    all_emails = []
+    delta_link = None
 
     while url:
-        emails, next_delta_link = fetch_emails_with_delta(url, headers)
-        if not emails:
-            logging.info("No more emails to process.")
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code != 200:
+            logging.error(f"Failed to retrieve emails: {response.json()}")
+            return all_emails, delta_link
+
+        response_json = response.json()
+        emails = response_json.get("value", [])
+        all_emails.extend(emails)
+
+        # Check if there are more pages
+        url = response_json.get("@odata.nextLink")  # Get next page if available
+        if "@odata.deltaLink" in response_json:
+            delta_link = response_json["@odata.deltaLink"]  # Save delta link for resuming later
+
+    return all_emails, delta_link
+
+def process_emails(table_name, timestamp):
+    """Fetch emails using Microsoft Graph's delta queries in 100-email chunks, starting from the OLDEST."""
+    access_token = get_access_token()
+    headers = {"Authorization": f"Bearer {access_token}"}
+    
+    # Retrieve last stored deltaLink for continuing a previous session
+    delta_link = get_value_from_db(f"collection-emails-{timestamp}-deltalink")
+    
+    # If resuming, use deltaLink. Otherwise, start from the oldest emails with a delta query
+    if delta_link:
+        logging.info(f"🟢 Resuming email collection using delta link.")
+        url = delta_link  # Resume from last session
+    else:
+        logging.info(f"🟢 Starting new email collection from oldest messages.")
+        url = f"{GRAPH_API_URL}/delta?$top=100&$orderby=receivedDateTime asc"
+
+    total_processed = 0  # Track number of emails processed
+
+    while url:
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code != 200:
+            logging.error(f"❌ Failed to retrieve emails: {response.json()}")
             break
 
-        # ✅ FIX: Unpacking correctly to avoid tuple concatenation error
-        total_processed, last_processed_time = process_email_metadata_batch(emails, table_name, total_processed)
+        response_json = response.json()
+        emails = response_json.get("value", [])
+        next_link = response_json.get("@odata.nextLink")  # For pagination
+        delta_link = response_json.get("@odata.deltaLink")  # For session resumption
 
-        # Store deltaLink for continuation
-        if next_delta_link:
-            log_to_database(f"collection-emails-{timestamp}-deltalink", next_delta_link)
-            url = next_delta_link  # Use deltaLink for next iteration
+        if emails:
+            total_processed = process_email_metadata_batch(emails, table_name, total_processed)
+
+        # **If `nextLink` exists, continue paginating in this session**
+        if next_link:
+            logging.info(f"🔄 Fetching next batch of 100 emails...")
+            url = next_link  # **Next batch (increments window)**
+        elif delta_link:
+            logging.info(f"✅ Storing delta link for future runs.")
+            log_to_database(f"collection-emails-{timestamp}-deltalink", delta_link)  # **Save for next session**
+            url = None  # Stop fetching
         else:
-            logging.info("No delta link found; reached end of traversal.")
-            url = None
+            logging.info("🔴 No more data. Ending session.")
+            url = None  # No more emails
 
         log_to_database(f"collection-emails-{timestamp}-count", str(total_processed))
-        logging.info(f"Processed ({total_processed}, '{last_processed_time}') emails.")
+        logging.info(f"📨 Processed {total_processed} emails.")
 
     log_to_database(f"collection-emails-{timestamp}-complete", "true")
-    logging.info(f"Email collection completed. Total emails processed: {total_processed}")
+    logging.info(f"✅ Email collection completed. Total emails processed: {total_processed}")
 
 
 
