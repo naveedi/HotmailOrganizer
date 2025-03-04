@@ -410,7 +410,7 @@ def fetch_emails_with_delta(url, headers):
 
 def process_emails_simplified(table_name, timestamp):
     """Fetches emails in order, writes them to the database, and logs progress every 100 emails."""
-    access_token = get_access_token()
+    access_token = refresh_access_token()
     headers = {"Authorization": f"Bearer {access_token}"}
 
     # Start fresh: Fetch newest emails first
@@ -426,7 +426,14 @@ def process_emails_simplified(table_name, timestamp):
             logging.error(f"❌ Failed to retrieve emails: {response.json()}")
             break
 
-        response_json = response.json()
+        # ✅ Handle JSONDecodeError gracefully
+        try:
+            response_json = response.json()
+        except json.JSONDecodeError as e:
+            logging.error(f"❌ JSON Decode Error: {e}. Response content:")
+            logging.error(response.text[:1000])  # Log first 1000 characters for debugging
+            break  # Stop processing to avoid corrupt data
+
         emails = response_json.get("value", [])
         url = response_json.get("@odata.nextLink")  # Get the next page of results
 
