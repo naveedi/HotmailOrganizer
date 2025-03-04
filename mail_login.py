@@ -431,36 +431,39 @@ def store_emails(emails):
         
         for email in emails:
             try:
-                # Store the stable email ID so we can use it later for deletion if required
-                email_id = email.get("id", "")  # Store the email ID
+                # Store the stable email ID (ensure empty string if missing)
+                email_id = email.get("id", "")  
 
-                # Handle missing sender details safely
-                sender = email.get("from", {}).get("emailAddress", {})
-                sender_email = sender.get("address", "") if isinstance(sender, dict) else ""
-                sender_name = sender.get("name", "") if isinstance(sender, dict) else ""
+                # Extract sender details safely
+                sender = email.get("from", {}).get("emailAddress", {}) or {}
+                sender_email = sender.get("address", "") 
+                sender_name = sender.get("name", "")
 
                 # Ensure email has a valid received date
                 email_datetime = email.get("receivedDateTime", "")
                 if email_datetime:
-                    email_datetime = datetime.strptime(email_datetime, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d %H:%M:%S")
+                    try:
+                        email_datetime = datetime.strptime(email_datetime, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        email_datetime = ""  # Handle invalid datetime format gracefully
 
                 # Handle missing or empty toRecipients
-                to_recipients = email.get("toRecipients", [])
-                to_email = to_recipients[0]["emailAddress"]["address"] if to_recipients and "emailAddress" in to_recipients[0] else ""
-                to_name = to_recipients[0]["emailAddress"]["name"] if to_recipients and "emailAddress" in to_recipients[0] else ""
+                to_recipients = email.get("toRecipients", []) or []
+                to_email = to_recipients[0].get("emailAddress", {}).get("address", "") if to_recipients else ""
+                to_name = to_recipients[0].get("emailAddress", {}).get("name", "") if to_recipients else ""
 
                 # Handle missing sender details (sometimes "from" and "sender" may differ)
-                sender_data = email.get("sender", {}).get("emailAddress", {})
-                from_email = sender_data.get("address", "") if isinstance(sender_data, dict) else ""
-                from_name = sender_data.get("name", "") if isinstance(sender_data, dict) else ""
+                sender_data = email.get("sender", {}).get("emailAddress", {}) or {}
+                from_email = sender_data.get("address", "") 
+                from_name = sender_data.get("name", "")
 
-                #  Calculate email size from body content
-                email_body = email.get("body", {}).get("content", "")
+                # Extract email body and calculate size from body content (in bytes)
+                email_body = email.get("body", {}).get("content", "") or ""
                 email_size = len(email_body.encode('utf-8'))  # Get actual byte size
 
-                # Ensure attachments are properly detected
+                # Ensure attachments field is boolean
                 has_attachments = email.get("hasAttachments", False)
-                has_attachments = bool(has_attachments) if isinstance(has_attachments, bool) else False
+                has_attachments = bool(has_attachments)  # Enforce boolean type
 
                 # Add to batch
                 data.append((email_id, sender_email, sender_name, email_datetime, to_email, to_name, from_email, from_name, email_size, has_attachments))
@@ -484,6 +487,7 @@ def store_emails(emails):
                 logging.info(f"✅ Inserted {len(data)} emails into the database.")
             except sqlite3.DatabaseError as db_error:
                 logging.error(f"❌ Database error while inserting emails: {db_error}")
+
 
 
 def process_emails():
