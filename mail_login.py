@@ -3,11 +3,11 @@ import requests
 import sqlite3
 import logging
 import time
-import re
-import jwt
-import hashlib
 import json
-from datetime import datetime, timezone
+import jwt
+from datetime import datetime, timedelta, timezone
+
+# Configuration
 
 # Configuration
 DATABASE_FILE = "mail_login.db"
@@ -19,20 +19,18 @@ DEVICE_CODE_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/de
 
 GRAPH_API_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
 SCOPES = "Mail.ReadWrite offline_access"
+BATCH_SIZE = 100
 
-BATCH_SIZE = 100  # Commit every 100 emails
-
-# Set up logging
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+# Logging setup
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 # ---- Database Setup ----
 def initialize_database():
-    """Creates SQLite database and the 'meta' table if not exists."""
+    """Creates SQLite database and ensures required tables exist with the latest schema."""
     with sqlite3.connect(DATABASE_FILE) as conn:
         cursor = conn.cursor()
+
+        # Create the `meta` table for storing last processed month and other metadata
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS meta (
                 name TEXT PRIMARY KEY,
@@ -40,146 +38,56 @@ def initialize_database():
                 last_modified DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Create or update the `emails` table with new fields
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS emails (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email_id TEXT UNIQUE,  -- Unique email identifier for deletion
+                sender_email TEXT,
+                sender_friendly_name TEXT,
+                email_datetime DATETIME,  -- Now properly stored as a datetime type
+                to_email TEXT,
+                to_friendly_name TEXT,
+                from_email TEXT,
+                from_friendly_name TEXT,
+                email_size INTEGER,
+                has_attachments BOOLEAN
+            )
+        """)
+
+        # Ensure `email_id` column exists (for users with the old schema)
+        cursor.execute("PRAGMA table_info(emails)")
+        columns = {row[1] for row in cursor.fetchall()}
+        
+        if "email_id" not in columns:
+            logging.info("🔄 Updating database: Adding 'email_id' column to 'emails' table.")
+            cursor.execute("ALTER TABLE emails ADD COLUMN email_id TEXT UNIQUE;")
+        
+        if "email_datetime" in columns:
+            logging.info("✅ Database already using proper schema for 'email_datetime'.")
+
         conn.commit()
 
+
 def log_to_database(name, value):
-    """Logs a timestamped entry into the meta table while handling database errors."""
-    try:
-        value = value.strip()  # Ensure no trailing spaces or newlines
-        with sqlite3.connect(DATABASE_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO meta (name, value, last_modified)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(name) DO UPDATE SET value = excluded.value, last_modified = excluded.last_modified
-            """, (name, value))
-            conn.commit()
-        logging.info(f"✅ DB Updated: {name} = {value[:20]}... (masked)")  # Mask for security
-    except sqlite3.DatabaseError as e:
-        logging.error(f"❌ Database error: {e}")
-
-
-_token_cache = {}  # In-memory cache for tokens
+    """Logs a value in the meta table."""
+    with sqlite3.connect(DATABASE_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO meta (name, value, last_modified)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(name) DO UPDATE SET value = excluded.value, last_modified = excluded.last_modified
+        """, (name, value))
+        conn.commit()
 
 def get_value_from_db(name):
-    """Retrieves a value from the meta table, using a cache to minimize database queries."""
-    if name in _token_cache:
-        return _token_cache[name]  # Return cached value
-
+    """Retrieves a value from the meta table."""
     with sqlite3.connect(DATABASE_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM meta WHERE name = ?", (name,))
         result = cursor.fetchone()
-        value = result[0] if result else None
-
-    if value:
-        _token_cache[name] = value  # Cache it for reuse
-    return value
-
-
-
-def refresh_access_token():
-    """Refreshes the access token using the stored refresh token."""
-    refresh_token = get_value_from_db("refresh_token")
-
-    if not refresh_token:
-        logging.error("No refresh token found in database. Please reauthenticate.")
-        exit(1)
-
-    data = {
-        "client_id": CLIENT_ID,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token
-    }
-
-    response = requests.post(TOKEN_URL, data=data)
-    tokens = response.json()
-
-    if "access_token" in tokens and "refresh_token" in tokens:
-        logging.info("✅ Access token refreshed successfully!")
-
-        # Update access token and refresh token in the database
-        log_to_database("access_token", tokens["access_token"])
-        log_to_database("refresh_token", tokens["refresh_token"])
-
-        return tokens["access_token"]
-    else:
-        logging.error(f"❌ Error refreshing token: {tokens}")
-        exit(1)
-
-def refresh_token_command():
-    """Explicitly refreshes the access token and logs the result."""
-    logging.info("🔄 Forcing an access token refresh...")
-    new_token = refresh_access_token()
-    logging.info("✅ Access token refreshed successfully and stored in the database.")
-
-
-def string_compare(str1, str2, max_diffs=5):
-    """Compares two strings index by index and outputs differences up to max_diffs."""
-    
-    # Generate header with first 20 characters and lengths
-    header = f"compare str1:20({str1[:50]}) to str2:20({str2[:50]}) | lengths: {len(str1)} vs {len(str2)}"
-    print(header)
-    
-    min_length = min(len(str1), len(str2))
-    differences = []
-    
-    # Compare characters index by index
-    for i in range(min_length):
-        if str1[i] != str2[i]:
-            differences.append(f"diff({i:03}) '{str1[i]}' != '{str2[i]}'")
-            if len(differences) >= max_diffs:
-                break
-
-    # Handle cases where one string is longer
-    if len(differences) < max_diffs:
-        if len(str1) > len(str2):
-            for i in range(min_length, len(str1)):
-                differences.append(f"diff({i:03}) '{str1[i]}' != ''")
-                if len(differences) >= max_diffs:
-                    break
-        elif len(str2) > len(str1):
-            for i in range(min_length, len(str2)):
-                differences.append(f"diff({i:03}) '' != '{str2[i]}'")
-                if len(differences) >= max_diffs:
-                    break
-
-    # Print results
-    if differences:
-        for diff in differences:
-            print(diff)
-    else:
-        print("Strings are identical")
-
-def get_access_token(caller="unknown"):
-    """Retrieves access token from the database and logs debug info."""
-    access_token = get_value_from_db("access_token")
-
-    if not access_token:
-        logging.error(f"[{caller}] No access token found in the database.")
-        exit(1)
-
-    logging.info(f"[{caller}] Using access token: {access_token[:20]}... (masked)")
-
-    # Only attempt to decode if the token has 3 segments (JWT format)
-    if access_token.count('.') == 2:
-        try:
-            decoded_token = jwt.decode(access_token, options={"verify_signature": False})
-            exp_time = decoded_token["exp"]
-            current_time = int(time.time())
-
-            if current_time >= exp_time:
-                logging.info(f"[{caller}] Access token expired. Refreshing...")
-                return refresh_access_token()
-
-        except jwt.DecodeError:
-            logging.warning(f"[{caller}] Token is not a valid JWT, but it may still be a valid opaque token.")
-
-    else:
-        logging.info(f"[{caller}] Token is not a JWT (may be an opaque token). Skipping decode.")
-
-    return access_token
-
+    return result[0] if result else None
 
 # ---- Step 1: Registration ----
 def register_device():
@@ -266,10 +174,7 @@ def store_access_in_db():
     log_to_database("access_token", access_token)
     logging.info("Stored access token in database.")
 
-# ---- Step 4: Fetch Latest Email ----
-
-import json
-
+# Verification of access by grabbing latest
 def display_email_fields(email):
     """Displays all fields of an email, pretty-printing JSON structures and truncating output at 1000 characters."""
     logging.info("🔍 Displaying all available email fields:")
@@ -285,7 +190,6 @@ def display_email_fields(email):
         value_str = value_str[:100] + "..." if len(value_str) > 1000 else value_str
 
         logging.info(f"{key}: {value_str}")
-
 
 
 def fetch_latest_email(access_token):
@@ -323,9 +227,6 @@ def fetch_latest_email(access_token):
     logging.info(f"Received At: {latest_email['receivedDateTime']}")
     logging.info(f"Body (first 100 chars): {email_body.strip()[:100]}")
 
-
-
-# ---- Step 5: Verify Access ----
 def verify_access():
     """
     Verifies access using the stored access token in the database.
@@ -337,281 +238,7 @@ def verify_access():
     logging.info("[verify-access] Retrieved access token successfully.")
     fetch_latest_email(access_token)
 
-
-def collect_emails():
-    """Starts a new email collection process."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    table_name = f"collection_emails_{timestamp}"
-
-    initialize_database()
-    log_to_database("collection-emails-current-table", table_name)
-
-    with sqlite3.connect(DATABASE_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sender_email TEXT,
-                sender_friendly_name TEXT,
-                email_datetime TEXT,
-                to_email TEXT,
-                to_friendly_name TEXT,
-                from_email TEXT,
-                from_friendly_name TEXT
-            )
-        """)
-        conn.commit()
-
-    log_to_database(f"collection-emails-{timestamp}-complete", "false")
-    #process_emails(table_name, timestamp)
-    process_emails_simplified(table_name, timestamp)
-
-
-
-def collect_emails_continue():
-    """Resumes email collection using the last stored delta link."""
-    table_name = get_value_from_db("collection-emails-current-table")
-
-    if not table_name:
-        logging.error("No previous email collection session found. Run 'collect-emails' first.")
-        return
-
-    complete = get_value_from_db(f"{table_name}-complete")
-    if complete == "true":
-        logging.info("Email collection is already complete. No action needed.")
-        return
-
-    process_emails(table_name, table_name.split("_")[-1])
-
-
-def fetch_emails_with_delta(url, headers):
-    """Fetches emails using Microsoft Graph's delta query and handles pagination."""
-    all_emails = []
-    delta_link = None
-
-    while url:
-        response = requests.get(url, headers=headers)
-        
-        if response.status_code != 200:
-            logging.error(f"Failed to retrieve emails: {response.json()}")
-            return all_emails, delta_link
-
-        response_json = response.json()
-        emails = response_json.get("value", [])
-        all_emails.extend(emails)
-
-        # Check if there are more pages
-        url = response_json.get("@odata.nextLink")  # Get next page if available
-        if "@odata.deltaLink" in response_json:
-            delta_link = response_json["@odata.deltaLink"]  # Save delta link for resuming later
-
-    return all_emails, delta_link
-
-
-def process_emails_simplified(table_name, timestamp):
-    """Fetches emails in order, writes them to the database, and logs progress every 100 emails."""
-    access_token = refresh_access_token()
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    # Start fresh: Fetch newest emails first
-    url = f"{GRAPH_API_URL}?$orderby=receivedDateTime desc&$top=100"
-
-    total_processed = 0
-    email_data = []  # Store data in memory before batch insert
-
-    while url:
-        response = requests.get(url, headers=headers)
-
-        if response.status_code != 200:
-            logging.error(f"❌ Failed to retrieve emails: {response.json()}")
-            break
-
-        # ✅ Handle JSONDecodeError gracefully
-        try:
-            response_json = response.json()
-        except json.JSONDecodeError as e:
-            logging.error(f"❌ JSON Decode Error: {e}. Response content:")
-            logging.error(response.text[:1000])  # Log first 1000 characters for debugging
-            break  # Stop processing to avoid corrupt data
-
-        emails = response_json.get("value", [])
-        url = response_json.get("@odata.nextLink")  # Get the next page of results
-
-        if not emails:
-            logging.info("✅ No more emails to process.")
-            break
-
-        # Process emails one by one
-        for email in emails:
-            try:
-                sender_email = email.get("from", {}).get("emailAddress", {}).get("address", "")
-                sender_name = email.get("from", {}).get("emailAddress", {}).get("name", "")
-                email_datetime = email.get("receivedDateTime", "")
-                subject = email.get("subject", "(No Subject)")
-
-                to_recipients = email.get("toRecipients", [])
-                to_email = to_recipients[0]["emailAddress"]["address"] if to_recipients else ""
-                to_name = to_recipients[0]["emailAddress"]["name"] if to_recipients else ""
-
-                from_email = email.get("from", {}).get("emailAddress", {}).get("address", "")
-                from_name = email.get("from", {}).get("emailAddress", {}).get("name", "")
-
-                # Log warnings for missing critical fields
-                if not sender_email:
-                    logging.warning(f"⚠️ Missing sender email in message {email.get('id', '(unknown ID)')}")
-                if not email_datetime:
-                    logging.warning(f"⚠️ Missing datetime in message {email.get('id', '(unknown ID)')}")
-
-                total_processed += 1
-
-                # Store email data for batch writing
-                email_data.append((sender_email, sender_name, email_datetime, to_email, to_name, from_email, from_name))
-
-                # Log progress every 100 emails
-                if total_processed % 100 == 0:
-                    logging.info(f"📨 {total_processed} processed | {email_datetime} | {subject}")
-
-            except Exception as e:
-                logging.error(f"❌ Error processing email: {e}")
-                continue  # Skip this email and move to the next
-
-        # Insert collected emails into the database in batches
-        if email_data:
-            update_email_table(email_data, table_name)
-            email_data.clear()  # Clear stored emails after writing
-
-    logging.info(f"🎉 Completed processing {total_processed} emails.")
-
-
-
-def process_emails(table_name, timestamp):
-    """Fetches emails using Microsoft Graph's delta queries and stores metadata into the database."""
-    access_token = get_access_token()
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    # Get last saved delta link if available (used only for resuming sessions)
-    delta_link = get_value_from_db(f"collection-emails-{timestamp}-deltalink")
-
-    if delta_link:
-        logging.info("📌 Resuming email collection using stored delta link.")
-        url = delta_link  # Use the saved delta query URL
-    else:
-        logging.info("🆕 Starting new email collection (fetching most recent first).")
-        url = f"{GRAPH_API_URL}/delta?$orderby=receivedDateTime desc&$top=100"  # ✅ Most recent first
-
-    total_processed = 0
-    last_processed_time = None  # Track latest timestamp
-
-    while url:
-        emails, next_delta_link = fetch_emails_with_delta(url, headers)
-        if not emails:
-            logging.info("✅ No more emails to process.")
-            break
-
-        # ✅ Correct tuple unpacking
-        total_processed, last_processed_time = process_email_metadata_batch(emails, table_name, total_processed)
-
-        # ✅ Store delta link for continuation
-        if next_delta_link:
-            log_to_database(f"collection-emails-{timestamp}-deltalink", next_delta_link)
-            url = next_delta_link  # Use delta link for next iteration
-        else:
-            logging.info("🚀 No delta link found; reached the end of the traversal.")
-            url = None
-
-        # ✅ Store progress periodically in the database
-        log_to_database(f"collection-emails-{timestamp}-count", str(total_processed))
-        logging.info(f"📨 Processed {total_processed} emails. Last email: {last_processed_time}")
-
-    # ✅ Mark collection as complete
-    log_to_database(f"collection-emails-{timestamp}-complete", "true")
-    logging.info(f"🎉 Email collection completed. Total emails processed: {total_processed}")
-
-
-
-def process_email_metadata_batch(emails, table_name, total_processed):
-    """Processes a batch of emails, extracting full metadata and inserting into the database."""
-    email_data = []
-    last_processed_time = None  # Track last timestamp
-
-    for email in emails:
-        sender_email = email["from"]["emailAddress"]["address"]
-        sender_name = email["from"]["emailAddress"].get("name", "")
-        email_datetime = email["receivedDateTime"]  # Extract timestamp
-
-        to_email = email.get("toRecipients", [])
-        to_email = to_email[0]["emailAddress"]["address"] if to_email else ""
-
-        to_name = email.get("toRecipients", [])
-        to_name = to_name[0]["emailAddress"].get("name", "") if to_name else ""
-
-        from_email = email.get("sender", {}).get("emailAddress", {}).get("address", "")
-        from_name = email.get("sender", {}).get("emailAddress", {}).get("name", "")
-
-        total_processed += 1
-        last_processed_time = email_datetime  # Update latest timestamp
-
-        email_data.append((sender_email, sender_name, email_datetime, to_email, to_name, from_email, from_name))
-
-        # Debug log: Print each processed email
-        logging.debug(f"{total_processed:05}, {sender_email}, {sender_name}, {email_datetime}, {to_email}, {to_name}, {from_email}, {from_name}")
-
-    if email_data:
-        update_email_table(email_data, table_name)
-
-    return total_processed, last_processed_time  # Return updated last time
-
-
-def update_email_table(email_data, table_name):
-    """Inserts processed email metadata into the database."""
-    try:
-        with sqlite3.connect(DATABASE_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.executemany(f"""
-                INSERT INTO {table_name} (sender_email, sender_friendly_name, email_datetime, 
-                                          to_email, to_friendly_name, from_email, from_friendly_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, email_data)
-            conn.commit()
-        logging.info(f"Inserted {len(email_data)} emails into {table_name}")
-    except sqlite3.DatabaseError as e:
-        logging.error(f"Database error while inserting emails: {e}")
-
-
-
-def fetch_emails(headers, params):
-    """Fetches emails from Microsoft Graph API."""
-    response = requests.get(GRAPH_API_URL, headers=headers, params=params)
-    
-    if response.status_code != 200:
-        logging.error(f"Failed to retrieve emails: {response.json()}")
-        return []
-
-    return response.json().get("value", [])
-
-
-def process_email_batch(emails, sender_counts, total_processed):
-    """Processes a batch of emails, extracting sender info and updating counts."""
-    for email in emails:
-        sender_email = email["from"]["emailAddress"]["address"]
-        sender_name = email["from"]["emailAddress"].get("name", "")
-        email_datetime = email["receivedDateTime"]
-        email_subject = email["subject"]
-
-        # Update sender count
-        if sender_email in sender_counts:
-            sender_counts[sender_email]["total_count"] += 1
-        else:
-            sender_counts[sender_email] = {"friendly_name": sender_name, "total_count": 1}
-
-        total_processed += 1
-
-        # Log each processed email
-        logging.debug(f"{total_processed:05}, {sender_email}, {email_subject}, {email_datetime}")
-
-    return total_processed, email_datetime  # Return new count and last email timestamp
-
-
+#   Process senders from emails table
 def process_senders():
     """Processes collected emails to generate sender statistics: first email, last email, and count."""
     table_name = get_value_from_db("collection-emails-current-table")
@@ -678,14 +305,229 @@ def process_senders():
     logging.info(f"✅ Processed {len(sender_stats)} senders and stored them in {senders_table}")
     log_to_database("collection-senders-current-table", senders_table)
 
+# ---- Step 4: Refresh ----
+def refresh_access_token():
+    """Refreshes the access token using the stored refresh token."""
+    refresh_token = get_value_from_db("refresh_token")
+    if not refresh_token:
+        logging.error("No refresh token found in database. Please reauthenticate.")
+        exit(1)
+
+    data = {
+        "client_id": CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token
+    }
+
+    response = requests.post(TOKEN_URL, data=data)
+    tokens = response.json()
+
+    if "access_token" in tokens and "refresh_token" in tokens:
+        logging.info("✅ Access token refreshed successfully!")
+        log_to_database("access_token", tokens["access_token"])
+        log_to_database("refresh_token", tokens["refresh_token"])
+        return tokens["access_token"]
+    else:
+        logging.error(f"❌ Error refreshing token: {tokens}")
+        exit(1)
+
+def refresh_token_command():
+    """Explicitly refreshes the access token and logs the result."""
+    logging.info("🔄 Forcing an access token refresh...")
+    new_token = refresh_access_token()
+    logging.info("✅ Access token refreshed successfully and stored in the database.")
+
+def get_access_token(caller="unknown"):
+    """Retrieves access token from the database and logs debug info."""
+    access_token = get_value_from_db("access_token")
+
+    if not access_token:
+        logging.error(f"[{caller}] No access token found in the database.")
+        exit(1)
+
+    logging.info(f"[{caller}] Using access token: {access_token[:20]}... (masked)")
+
+    # Only attempt to decode if the token has 3 segments (JWT format)
+    if access_token.count('.') == 2:
+        try:
+            decoded_token = jwt.decode(access_token, options={"verify_signature": False})
+            exp_time = decoded_token["exp"]
+            current_time = int(time.time())
+
+            if current_time >= exp_time:
+                logging.info(f"[{caller}] Access token expired. Refreshing...")
+                return refresh_access_token()
+
+        except jwt.DecodeError:
+            logging.warning(f"[{caller}] Token is not a valid JWT, but it may still be a valid opaque token.")
+
+    else:
+        logging.info(f"[{caller}] Token is not a JWT (may be an opaque token). Skipping decode.")
+
+    return access_token
+
+
+
+def fetch_emails(headers, filter_query):
+    """Fetches emails from Microsoft Graph API based on the filter query, with error handling and token refresh."""
+    url = f"{GRAPH_API_URL}?$top={BATCH_SIZE}&{filter_query}"
+    emails = []
+    retry = False  # ✅ Added to track retries
+
+    while url:
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 401 and not retry:  # Token expired
+            logging.warning("🔄 Token expired! Refreshing access token and retrying...")
+            new_access_token = refresh_access_token()
+            headers["Authorization"] = f"Bearer {new_access_token}"
+            retry = True  # ✅ Allow one retry
+            continue  # Retry the request with the new token
+
+        if response.status_code != 200:
+            logging.error(f"❌ Failed to retrieve emails: {response.text}")  # Log raw response
+            return []
+
+        try:
+            response_json = response.json()
+        except json.JSONDecodeError as e:
+            logging.error(f"❌ JSON Decode Error: {e.msg} at position {e.pos}. Raw response: {response.text[:1000]}...")  # Log first 1000 chars of response
+            return []
+
+        emails.extend(response_json.get("value", []))
+        url = response_json.get("@odata.nextLink")  # Get next page URL if available
+
+    return emails
+
+
+
+
+def process_emails_by_month(year, month):
+    """Processes all emails for a given month, ensuring proper datetime filtering."""
+    access_token = refresh_access_token()
+    headers = {"Authorization": f"Bearer {access_token}"}
+    
+    # Compute first and last day of the month
+    start_date = datetime(year, month, 1, tzinfo=timezone.utc)  # Ensure timezone-aware
+    next_month = start_date.replace(day=28) + timedelta(days=4)  # Move to next month
+    end_date = next_month.replace(day=1) - timedelta(seconds=1)  # Last second of the month
+
+    logging.info(f"📅 Starting processing for {start_date.strftime('%Y-%m')}")
+
+    # ✅ Fix: Ensure proper Edm.DateTimeOffset format
+    start_date_str = start_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_date_str = end_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    filter_query = f"$filter=receivedDateTime ge datetime'{start_date_str}' and receivedDateTime lt datetime'{end_date_str}'"
+
+    emails = fetch_emails(headers, filter_query)
+
+    if emails:
+        store_emails(emails)
+        logging.info(f"✅ Finished processing {len(emails)} emails for {start_date.strftime('%Y-%m')}")
+    else:
+        logging.info(f"⚠️ No emails found for {start_date.strftime('%Y-%m')}")
+
+    # Mark month as processed
+    log_to_database("last_processed_month", f"{year}-{month:02d}")
+
+
+def store_emails(emails):
+    """Stores processed email data into the database with full error handling for missing fields."""
+    with sqlite3.connect(DATABASE_FILE) as conn:
+        cursor = conn.cursor()
+        data = []
+        
+        for email in emails:
+            try:
+                # Store the stable email ID so we can use it later for deletion if required
+                email_id = email.get("id", "")  # Store the email ID
+
+                # Handle missing sender details safely
+                sender = email.get("from", {}).get("emailAddress", {})
+                sender_email = sender.get("address", "") if isinstance(sender, dict) else ""
+                sender_name = sender.get("name", "") if isinstance(sender, dict) else ""
+
+                # Ensure email has a valid received date
+                email_datetime = email.get("receivedDateTime", "")
+                if email_datetime:
+                    email_datetime = datetime.strptime(email_datetime, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d %H:%M:%S")
+
+                # Handle missing or empty toRecipients
+                to_recipients = email.get("toRecipients", [])
+                to_email = to_recipients[0]["emailAddress"]["address"] if to_recipients and "emailAddress" in to_recipients[0] else ""
+                to_name = to_recipients[0]["emailAddress"]["name"] if to_recipients and "emailAddress" in to_recipients[0] else ""
+
+                # Handle missing sender details (sometimes "from" and "sender" may differ)
+                sender_data = email.get("sender", {}).get("emailAddress", {})
+                from_email = sender_data.get("address", "") if isinstance(sender_data, dict) else ""
+                from_name = sender_data.get("name", "") if isinstance(sender_data, dict) else ""
+
+                # Ensure email size is numeric
+                email_size = email.get("size", 0)
+                email_size = int(email_size) if isinstance(email_size, (int, float)) else 0
+
+                # Ensure attachments are properly detected
+                has_attachments = email.get("hasAttachments", False)
+                has_attachments = bool(has_attachments) if isinstance(has_attachments, bool) else False
+
+                # Add to batch
+                data.append((sender_email, sender_name, email_datetime, to_email, to_name, from_email, from_name, email_size, has_attachments))
+
+            except Exception as e:
+                logging.error(f"❌ Error processing email ID {email.get('id', 'UNKNOWN')}: {e}")
+                continue  # Skip problematic emails without stopping execution
+
+        # Insert into database in batch mode
+        if data:
+            try:
+                cursor.executemany("""
+                    INSERT INTO emails (
+                        email_id, sender_email, sender_friendly_name, email_datetime, 
+                        to_email, to_friendly_name, from_email, from_friendly_name, 
+                        email_size, has_attachments
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, data)
+
+                conn.commit()
+                logging.info(f"✅ Inserted {len(data)} emails into the database.")
+            except sqlite3.DatabaseError as db_error:
+                logging.error(f"❌ Database error while inserting emails: {db_error}")
+
+
+def process_emails():
+    """Processes emails month by month, starting from the last processed month and working backwards."""
+    current_date = datetime.now(timezone.utc)
+    last_processed = get_value_from_db("last_processed_month")
+
+    # Define the minimum date we will process (inclusive)
+    min_date = datetime(2013, 1, 1, tzinfo=timezone.utc)
+
+    if last_processed:
+        last_year, last_month = map(int, last_processed.split("-"))
+        start_date = datetime(last_year, last_month, 1, tzinfo=timezone.utc) - timedelta(days=1)
+    else:
+        start_date = current_date.replace(day=1, tzinfo=timezone.utc) - timedelta(days=1)  # Previous month
+
+    while start_date >= min_date:  # ✅ Stop when reaching 2013-01
+        process_emails_by_month(start_date.year, start_date.month)
+        start_date = start_date.replace(day=1) - timedelta(days=1)  # Move to previous month
+
+    logging.info("🎉 Completed processing all emails up to January 2013.")
+
+
 
 # ---- Main Execution ----
 def main():
     """Handles command-line arguments and executes the appropriate function."""
     parser = argparse.ArgumentParser(description="Hotmail Organizer - Authentication Manager")
-    parser.add_argument("action", choices=["registration", "poll-verification", "store-access-in-db",
+    parser.add_argument("action", choices=["registration", 
+                                           "poll-verification", 
                                            "verify-access", 
-                                           "collect-emails", "collect-emails-continue", "process-senders", "refresh-token" ],
+                                           "process-senders", 
+                                           "refresh-token",
+                                           "process-emails"
+                                         ],
                         help="Select the authentication step")
     
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -699,12 +541,10 @@ def main():
     actions = {
         "registration": register_device,
         "poll-verification": poll_verification,
-        "store-access-in-db": store_access_in_db,
         "verify-access": verify_access,
-        "collect-emails": collect_emails,
-        "collect-emails-continue": collect_emails_continue,
         "process-senders": process_senders,
         "refresh-token": refresh_token_command,  
+        "process-emails": process_emails,
     }
 
     actions[args.action]()
