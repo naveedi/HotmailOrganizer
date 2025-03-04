@@ -56,16 +56,6 @@ def initialize_database():
             )
         """)
 
-        # Ensure `email_id` column exists (for users with the old schema)
-        cursor.execute("PRAGMA table_info(emails)")
-        columns = {row[1] for row in cursor.fetchall()}
-        
-        if "email_id" not in columns:
-            logging.info("🔄 Updating database: Adding 'email_id' column to 'emails' table.")
-            cursor.execute("ALTER TABLE emails ADD COLUMN email_id TEXT UNIQUE;")
-        
-        if "email_datetime" in columns:
-            logging.info("✅ Database already using proper schema for 'email_datetime'.")
 
         conn.commit()
 
@@ -414,12 +404,12 @@ def process_emails_by_month(year, month):
 
     logging.info(f"📅 Starting processing for {start_date.strftime('%Y-%m')}")
 
-    # ✅ Fix: Ensure proper Edm.DateTimeOffset format
+    # ✅ Fix: Remove incorrect 'datetime' wrapping
     start_date_str = start_date.strftime('%Y-%m-%dT%H:%M:%SZ')
     end_date_str = end_date.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    filter_query = f"$filter=receivedDateTime ge datetime'{start_date_str}' and receivedDateTime lt datetime'{end_date_str}'"
-
+    filter_query = f"$filter=receivedDateTime ge {start_date_str} and receivedDateTime lt {end_date_str}"
+    
     emails = fetch_emails(headers, filter_query)
 
     if emails:
@@ -430,6 +420,7 @@ def process_emails_by_month(year, month):
 
     # Mark month as processed
     log_to_database("last_processed_month", f"{year}-{month:02d}")
+
 
 
 def store_emails(emails):
@@ -463,16 +454,16 @@ def store_emails(emails):
                 from_email = sender_data.get("address", "") if isinstance(sender_data, dict) else ""
                 from_name = sender_data.get("name", "") if isinstance(sender_data, dict) else ""
 
-                # Ensure email size is numeric
-                email_size = email.get("size", 0)
-                email_size = int(email_size) if isinstance(email_size, (int, float)) else 0
+                #  Calculate email size from body content
+                email_body = email.get("body", {}).get("content", "")
+                email_size = len(email_body.encode('utf-8'))  # Get actual byte size
 
                 # Ensure attachments are properly detected
                 has_attachments = email.get("hasAttachments", False)
                 has_attachments = bool(has_attachments) if isinstance(has_attachments, bool) else False
 
                 # Add to batch
-                data.append((sender_email, sender_name, email_datetime, to_email, to_name, from_email, from_name, email_size, has_attachments))
+                data.append((email_id, sender_email, sender_name, email_datetime, to_email, to_name, from_email, from_name, email_size, has_attachments))
 
             except Exception as e:
                 logging.error(f"❌ Error processing email ID {email.get('id', 'UNKNOWN')}: {e}")
